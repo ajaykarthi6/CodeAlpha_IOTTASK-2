@@ -1,0 +1,205 @@
+version: '3.8'
+
+services:
+  # Edge Device Simulation
+  edge-gateway:
+    image: aiot-edge:1.0
+    container_name: edge-gateway
+    environment:
+      - DEVICE_ID=EDGE_001
+      - CLOUD_ENDPOINT=mqtt://cloud-broker:8883
+      - LOG_LEVEL=INFO
+    ports:
+      - "8883:8883"    # MQTT
+      - "5000:5000"    # REST API
+      - "9090:9090"    # Prometheus metrics
+    volumes:
+      - ./config:/app/config:ro
+      - edge-models:/app/models
+      - edge-data:/data
+    networks:
+      - aiot-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    resources:
+      cpus: '2'
+      memory: 2G
+      limits:
+        cpus: '2.5'
+        memory: 2.5G
+
+  # MQTT Broker (Edge + Cloud)
+  mqtt-broker:
+    image: eclipse-mosquitto:latest
+    container_name: mqtt-broker
+    ports:
+      - "1883:1883"    # Standard MQTT
+      - "8883:8883"    # MQTT over TLS
+      - "9001:9001"    # WebSocket
+    volumes:
+      - ./config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-logs:/mosquitto/log
+    networks:
+      - aiot-network
+    restart: unless-stopped
+
+  # Time-Series Database
+  timescaledb:
+    image: timescale/timescaledb:latest-pg14
+    container_name: timescaledb
+    environment:
+      - POSTGRES_USER=aiot_user
+      - POSTGRES_PASSWORD=secure_password
+      - POSTGRES_DB=aiot_metrics
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - aiot-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiot_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: redis-cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - aiot-network
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+
+  # Monitoring & Metrics (Prometheus)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - aiot-network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: unless-stopped
+
+  # Visualization (Grafana)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    networks:
+      - aiot-network
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # Logging & Analysis (ELK Stack - Elasticsearch)
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.0.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - aiot-network
+    restart: unless-stopped
+
+  # Log Shipping (Logstash)
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.0.0
+    container_name: logstash
+    volumes:
+      - ./config/logstash.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+    ports:
+      - "5000:5000"
+    networks:
+      - aiot-network
+    depends_on:
+      - elasticsearch
+    restart: unless-stopped
+
+  # Log Visualization (Kibana)
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.0.0
+    container_name: kibana
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    networks:
+      - aiot-network
+    depends_on:
+      - elasticsearch
+    restart: unless-stopped
+
+  # Application API Server
+  api-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: api-server
+    environment:
+      - DATABASE_URL=postgresql://aiot_user:secure_password@timescaledb:5432/aiot_metrics
+      - REDIS_URL=redis://redis:6379
+      - MQTT_BROKER=mqtt-broker:1883
+      - ENV=production
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config:/app/config:ro
+    networks:
+      - aiot-network
+    depends_on:
+      - timescaledb
+      - redis
+      - mqtt-broker
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  edge-models:
+  edge-data:
+  mosquitto-data:
+  mosquitto-logs:
+  timescaledb-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+  elasticsearch-data:
+
+networks:
+  aiot-network:
+    driver: bridge

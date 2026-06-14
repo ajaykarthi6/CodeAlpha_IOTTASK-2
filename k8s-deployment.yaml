@@ -1,0 +1,388 @@
+---
+# AIoT Edge Gateway Kubernetes Deployment
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aiot-system
+  labels:
+    name: aiot-system
+
+---
+# ConfigMap for application configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aiot-config
+  namespace: aiot-system
+data:
+  device.id: "EDGE_001"
+  log.level: "INFO"
+  cloud.endpoint: "mqtt://cloud-broker.aiot-system.svc.cluster.local:1883"
+  inference.timeout.ms: "100"
+
+---
+# Secret for sensitive data
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aiot-secrets
+  namespace: aiot-system
+type: Opaque
+stringData:
+  db.password: "secure_password"
+  mqtt.username: "aiot_user"
+  mqtt.password: "aiot_password"
+  api.key: "your-api-key-here"
+
+---
+# PersistentVolumeClaim for models
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aiot-models-pvc
+  namespace: aiot-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# PersistentVolumeClaim for data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aiot-data-pvc
+  namespace: aiot-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+# Deployment for Edge Gateway
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiot-edge-gateway
+  namespace: aiot-system
+  labels:
+    app: aiot-edge-gateway
+    version: v1
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: aiot-edge-gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: aiot-edge-gateway
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: aiot-service-account
+      
+      # Init container for setup
+      initContainers:
+      - name: setup
+        image: busybox:1.35
+        command: ['sh', '-c', 'echo "Starting AIoT Edge Gateway..." && sleep 2']
+      
+      # Main containers
+      containers:
+      - name: edge-gateway
+        image: aiot-edge:1.0
+        imagePullPolicy: IfNotPresent
+        
+        ports:
+        - name: api
+          containerPort: 5000
+          protocol: TCP
+        - name: mqtt
+          containerPort: 8883
+          protocol: TCP
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        
+        # Environment variables
+        env:
+        - name: DEVICE_ID
+          valueFrom:
+            configMapKeyRef:
+              name: aiot-config
+              key: device.id
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: aiot-config
+              key: log.level
+        - name: CLOUD_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: aiot-config
+              key: cloud.endpoint
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: aiot-secrets
+              key: db.password
+        - name: MQTT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: aiot-secrets
+              key: mqtt.password
+        
+        # Resource requests and limits
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        
+        # Liveness probe
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: api
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        # Readiness probe
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: api
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+        
+        # Volume mounts
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+        - name: models
+          mountPath: /app/models
+        - name: data
+          mountPath: /app/data
+        - name: logs
+          mountPath: /app/logs
+        
+        # Security context
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop:
+            - ALL
+      
+      # Pod-level security context
+      securityContext:
+        fsGroup: 1000
+      
+      # Volumes
+      volumes:
+      - name: config
+        configMap:
+          name: aiot-config
+      - name: models
+        persistentVolumeClaim:
+          claimName: aiot-models-pvc
+      - name: data
+        persistentVolumeClaim:
+          claimName: aiot-data-pvc
+      - name: logs
+        emptyDir: {}
+      
+      # Pod disruption budget
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - aiot-edge-gateway
+              topologyKey: kubernetes.io/hostname
+
+---
+# Service for Edge Gateway
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiot-edge-gateway
+  namespace: aiot-system
+  labels:
+    app: aiot-edge-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app: aiot-edge-gateway
+  ports:
+  - name: api
+    port: 5000
+    targetPort: 5000
+    protocol: TCP
+  - name: mqtt
+    port: 8883
+    targetPort: 8883
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+
+---
+# Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aiot-service-account
+  namespace: aiot-system
+
+---
+# Role for RBAC
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aiot-role
+  namespace: aiot-system
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+
+---
+# RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aiot-rolebinding
+  namespace: aiot-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: aiot-role
+subjects:
+- kind: ServiceAccount
+  name: aiot-service-account
+  namespace: aiot-system
+
+---
+# HorizontalPodAutoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: aiot-edge-gateway-hpa
+  namespace: aiot-system
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: aiot-edge-gateway
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 30
+
+---
+# NetworkPolicy for security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aiot-network-policy
+  namespace: aiot-system
+spec:
+  podSelector:
+    matchLabels:
+      app: aiot-edge-gateway
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: aiot-system
+    ports:
+    - protocol: TCP
+      port: 5000
+    - protocol: TCP
+      port: 8883
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: aiot-system
+    ports:
+    - protocol: TCP
+      port: 1883
+
+---
+# Monitoring: ServiceMonitor (for Prometheus Operator)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: aiot-edge-gateway
+  namespace: aiot-system
+spec:
+  selector:
+    matchLabels:
+      app: aiot-edge-gateway
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
